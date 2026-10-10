@@ -10,12 +10,14 @@ package app.morphe.patches.music.misc.potoken
 import app.morphe.patches.music.misc.extension.sharedExtensionPatch
 import app.morphe.patches.music.misc.settings.PreferenceScreen
 import app.morphe.patches.music.shared.Constants.COMPATIBILITY_YOUTUBE_MUSIC
+import app.morphe.patches.music.shared.MusicActivityOnCreateFingerprint
 import app.morphe.patches.shared.misc.potoken.poTokenProviderPatch
 
 @Suppress("unused")
 val poTokenProviderPatch = poTokenProviderPatch(
     originalAppPackageName = COMPATIBILITY_YOUTUBE_MUSIC.packageName!!,
     preferenceScreen = PreferenceScreen.MISC,
+    mainActivityOnCreateFingerprint = MusicActivityOnCreateFingerprint,
     block = {
         compatibleWith(COMPATIBILITY_YOUTUBE_MUSIC)
 

@@ -7,6 +7,8 @@
 
 package app.morphe.patches.shared.misc.potoken
 
+import app.morphe.patcher.Fingerprint
+import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
 import app.morphe.patcher.patch.BytecodePatchBuilder
 import app.morphe.patcher.patch.BytecodePatchContext
 import app.morphe.patcher.patch.InstallerType
@@ -36,6 +38,7 @@ private val poTokenProviderResourcePatch = resourcePatch {
 internal fun poTokenProviderPatch(
     originalAppPackageName: String,
     preferenceScreen: BasePreferenceScreen.Screen,
+    mainActivityOnCreateFingerprint: Fingerprint,
     block: BytecodePatchBuilder.() -> Unit,
     executeBlock: BytecodePatchContext.() -> Unit = {},
 ) = bytecodePatch(
@@ -97,6 +100,11 @@ internal fun poTokenProviderPatch(
                 )
             }
         }
+
+        mainActivityOnCreateFingerprint.method.addInstruction(
+            0,
+            "invoke-static/range { p0 .. p0 }, $EXTENSION_CLASS->checkExpiredHelper(Landroid/app/Activity;)V"
+        )
 
         preferenceScreen.addPreferences(
             PreferenceScreenPreference(

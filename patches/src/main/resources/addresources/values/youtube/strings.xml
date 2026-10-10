@@ -597,10 +597,13 @@ Info: May not work on live streams"</string>
     <string name="morphe_queue_restore_summary">Queue is kept after restarting the app</string>
     <string name="morphe_swap_save_and_queue_actions_title">Swap Save and Queue actions</string>
     <string name="morphe_swap_save_and_queue_actions_summary">Tap for queue options, tap and hold to save to Watch later</string>
+    <!-- layout.flyout.addToQueuePatch -->
     <string name="morphe_queue_override_flyout_menu_title">Override feed flyout queue button</string>
     <string name="morphe_queue_override_flyout_menu_summary">Opens the Morphe queue instead of the YouTube queue</string>
     <string name="morphe_queue_add_flyout_menu_title">Add feed flyout queue menu item</string>
     <string name="morphe_queue_add_flyout_menu_summary">Adds an additional flyout item. Enable this if \"Add to queue\" is not shown</string>
+    <string name="morphe_queue_advance_playback_title">Queue playback</string>
+    <string name="morphe_queue_advance_playback_summary">Optional. One-tap Play next / Play last, advance with Next or at end of video, and remove watched items from the queue</string>
     <string name="morphe_ads_channel_whitelist_flyout_menu_title">Ad whitelist in flyout menu</string>
     <string name="morphe_ads_channel_whitelist_flyout_menu_summary">Adds a flyout item that lets ads play on the channel of that video</string>
     <!-- "Spoof video streams" must use the same translation as morphe_spoof_video_streams_screen_title -->
@@ -618,6 +621,8 @@ Info: May not work on live streams"</string>
     <string name="morphe_queue_manager_fetch_failed_save">Failed to save queue</string>
     <string name="morphe_queue_manager_fetch_succeeded_add">Added to queue</string>
     <string name="morphe_queue_manager_fetch_succeeded_create">Queue created</string>
+    <string name="morphe_queue_manager_fetch_succeeded_play_next">Queued to play next</string>
+    <string name="morphe_queue_manager_fetch_succeeded_play_last">Added to end of queue</string>
     <string name="morphe_queue_manager_fetch_succeeded_remove">Removed from queue</string>
     <string name="morphe_queue_manager_fetch_succeeded_save">Queue saved to %s</string>
     <string name="morphe_queue_manager_playlist_title">Morphe Queue</string>

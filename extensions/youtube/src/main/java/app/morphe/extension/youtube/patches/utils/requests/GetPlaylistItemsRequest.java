@@ -16,7 +16,7 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import app.morphe.extension.shared.Logger;
@@ -28,6 +28,9 @@ public class GetPlaylistItemsRequest {
     private GetPlaylistItemsRequest() {
     }
 
+    /**
+     * @return Ordered map of videoId → setVideoId (playlist order preserved).
+     */
     @Nullable
     public static Map<String, String> fetch(String playlistId, Map<String, String> requestHeader) {
         Utils.verifyOffMainThread();
@@ -106,7 +109,7 @@ public class GetPlaylistItemsRequest {
                 return null;
             }
 
-            Map<String, String> result = new HashMap<>();
+            Map<String, String> result = new LinkedHashMap<>();
             for (int i = 0, length = playlistContents.length(); i < length; i++) {
                 JSONObject element = playlistContents.optJSONObject(i);
                 if (element == null) {

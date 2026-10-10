@@ -28,6 +28,7 @@ import app.morphe.extension.shared.patches.ExoPlayerInterface;
 import app.morphe.extension.shared.patches.components.ContextInterface;
 import app.morphe.extension.youtube.patches.originaltitles.RestoreOriginalTitlesPatch;
 import app.morphe.extension.youtube.patches.playback.speed.RememberPlaybackSpeedPatch;
+import app.morphe.extension.youtube.patches.utils.PlaylistPatch;
 import app.morphe.extension.youtube.patches.voiceovertranslation.VoiceOverTranslationPatch;
 import app.morphe.extension.youtube.settings.Settings;
 import app.morphe.extension.youtube.shared.Event;
@@ -356,6 +357,7 @@ public final class VideoInformation {
         if (!videoId.equals(newlyLoadedVideoId)) {
             Logger.printDebug(() -> "New video ID: " + newlyLoadedVideoId);
             videoId = newlyLoadedVideoId;
+            PlaylistPatch.syncQueuePlaybackPosition(newlyLoadedVideoId);
         }
     }
 

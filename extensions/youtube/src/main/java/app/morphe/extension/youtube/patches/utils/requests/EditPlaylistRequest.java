@@ -15,7 +15,10 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
@@ -160,5 +163,119 @@ public class EditPlaylistRequest {
             return parseResponse(json, setVideoId != null && !setVideoId.isEmpty());
         }
         return null;
+    }
+
+    /**
+     * Synchronously adds a video to a playlist. Returns the new setVideoId, or null on failure.
+     */
+    @Nullable
+    public static String addVideoSync(
+            String videoId,
+            String playlistId,
+            Map<String, String> requestHeader
+    ) {
+        Utils.verifyOffMainThread();
+        JSONObject json = sendRequest(videoId, playlistId, null, requestHeader);
+        if (json != null) {
+            return parseResponse(json, false);
+        }
+        return null;
+    }
+
+    /**
+     * Removes playlist items in a single edit_playlist call.
+     *
+     * @param setVideoIds playlist setVideoId values to remove
+     */
+    public static boolean removeVideosSync(
+            String playlistId,
+            Collection<String> setVideoIds,
+            Map<String, String> requestHeader
+    ) {
+        Utils.verifyOffMainThread();
+        Objects.requireNonNull(playlistId);
+        if (setVideoIds == null || setVideoIds.isEmpty()) {
+            return true;
+        }
+        final List<String> ids = new ArrayList<>();
+        for (String setVideoId : setVideoIds) {
+            if (setVideoId != null && !setVideoId.isEmpty()) {
+                ids.add(setVideoId);
+            }
+        }
+        if (ids.isEmpty()) {
+            return true;
+        }
+
+        final long startTime = System.currentTimeMillis();
+        Logger.printDebug(() -> "Batch-removing " + ids.size() + " queue playlist items");
+        try {
+            byte[] requestBody = PlaylistRoutes.editPlaylistRemoveVideosBody(playlistId, ids);
+            if (requestBody.length == 0) {
+                return false;
+            }
+            HttpURLConnection connection = PlaylistRoutes.getConnection(
+                    PlaylistRoutes.EDIT_PLAYLIST, requestHeader);
+            connection.setFixedLengthStreamingMode(requestBody.length);
+            connection.getOutputStream().write(requestBody);
+            final int responseCode = connection.getResponseCode();
+            if (responseCode == Requester.HTTP_STATUS_CODE_SUCCESS) {
+                JSONObject json = Requester.parseJSONObject(connection);
+                return "STATUS_SUCCEEDED".equals(json.optString("status"));
+            }
+            handleConnectionError("Batch remove playlist videos failed with code: " + responseCode, null);
+        } catch (SocketTimeoutException ex) {
+            handleConnectionError("Connection timeout", ex);
+        } catch (IOException ex) {
+            handleConnectionError("Network error", ex);
+        } catch (Exception ex) {
+            Logger.printException(() -> "removeVideosSync failed", ex);
+        } finally {
+            Logger.printDebug(() -> "batch remove took: " + (System.currentTimeMillis() - startTime) + "ms");
+        }
+        return false;
+    }
+
+    /**
+     * Synchronously moves a playlist item to sit after {@code predecessorSetVideoId}.
+     */
+    public static boolean moveVideoAfterSync(
+            String playlistId,
+            String setVideoId,
+            String predecessorSetVideoId,
+            Map<String, String> requestHeader
+    ) {
+        Utils.verifyOffMainThread();
+        Objects.requireNonNull(playlistId);
+        Objects.requireNonNull(setVideoId);
+        Objects.requireNonNull(predecessorSetVideoId);
+
+        final long startTime = System.currentTimeMillis();
+        Logger.printDebug(() -> "Moving playlist item after predecessor, setVideoId: " + setVideoId
+                + ", predecessor: " + predecessorSetVideoId);
+
+        try {
+            byte[] requestBody = PlaylistRoutes.movePlaylistVideoAfterBody(
+                    playlistId, setVideoId, predecessorSetVideoId);
+            HttpURLConnection connection = PlaylistRoutes.getConnection(
+                    PlaylistRoutes.EDIT_PLAYLIST, requestHeader);
+            connection.setFixedLengthStreamingMode(requestBody.length);
+            connection.getOutputStream().write(requestBody);
+            final int responseCode = connection.getResponseCode();
+            if (responseCode == Requester.HTTP_STATUS_CODE_SUCCESS) {
+                JSONObject json = Requester.parseJSONObject(connection);
+                return "STATUS_SUCCEEDED".equals(json.optString("status"));
+            }
+            handleConnectionError("Move playlist video failed with code: " + responseCode, null);
+        } catch (SocketTimeoutException ex) {
+            handleConnectionError("Connection timeout", ex);
+        } catch (IOException ex) {
+            handleConnectionError("Network error", ex);
+        } catch (Exception ex) {
+            Logger.printException(() -> "moveVideoAfterSync failed", ex);
+        } finally {
+            Logger.printDebug(() -> "move took: " + (System.currentTimeMillis() - startTime) + "ms");
+        }
+        return false;
     }
 }

@@ -16,6 +16,7 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.Locale;
 import java.util.Map;
 
@@ -142,6 +143,61 @@ public final class PlaylistRoutes {
             return body.toString().getBytes(StandardCharsets.UTF_8);
         } catch (JSONException ex) {
             Logger.printException(() -> "editPlaylistBody failed", ex);
+        }
+        return new byte[0];
+    }
+
+    /**
+     * Batch-remove playlist items in one edit_playlist request.
+     */
+    public static byte[] editPlaylistRemoveVideosBody(String playlistId, Collection<String> setVideoIds) {
+        try {
+            JSONObject body = getBaseContentJson();
+            body.put("playlistId", playlistId);
+            JSONArray actions = new JSONArray();
+            for (String setVideoId : setVideoIds) {
+                if (setVideoId == null || setVideoId.isEmpty()) {
+                    continue;
+                }
+                JSONObject action = new JSONObject();
+                action.put("action", "ACTION_REMOVE_VIDEO");
+                action.put("setVideoId", setVideoId);
+                actions.put(action);
+            }
+            if (actions.length() == 0) {
+                return new byte[0];
+            }
+            body.put("actions", actions);
+            return body.toString().getBytes(StandardCharsets.UTF_8);
+        } catch (JSONException ex) {
+            Logger.printException(() -> "editPlaylistRemoveVideosBody failed", ex);
+        }
+        return new byte[0];
+    }
+
+    /**
+     * Moves a playlist item so it sits immediately after {@code predecessorSetVideoId}.
+     */
+    public static byte[] movePlaylistVideoAfterBody(
+            String playlistId,
+            String setVideoId,
+            String predecessorSetVideoId
+    ) {
+        try {
+            JSONObject body = getBaseContentJson();
+            body.put("playlistId", playlistId);
+
+            JSONObject action = new JSONObject();
+            action.put("action", "ACTION_MOVE_VIDEO_AFTER");
+            action.put("setVideoId", setVideoId);
+            action.put("movedSetVideoIdPredecessor", predecessorSetVideoId);
+
+            JSONArray actions = new JSONArray();
+            actions.put(action);
+            body.put("actions", actions);
+            return body.toString().getBytes(StandardCharsets.UTF_8);
+        } catch (JSONException ex) {
+            Logger.printException(() -> "movePlaylistVideoAfterBody failed", ex);
         }
         return new byte[0];
     }

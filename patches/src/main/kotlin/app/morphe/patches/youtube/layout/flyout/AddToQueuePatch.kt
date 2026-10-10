@@ -2,7 +2,7 @@
  * Copyright 2026 Morphe.
  * https://github.com/MorpheApp/morphe-patches/pull/1837
  *
- * See the included NOTICE file for GPLv3 Section 7 terms that apply to this code.
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to Morphe contributions.
  */
 
 package app.morphe.patches.youtube.layout.flyout
@@ -21,23 +21,34 @@ import app.morphe.patches.youtube.misc.proto.elementProtoParserHookPatch
 import app.morphe.patches.youtube.misc.settings.PreferenceScreen
 import app.morphe.patches.youtube.misc.settings.settingsPatch
 import app.morphe.patches.youtube.shared.Constants.COMPATIBILITY_YOUTUBE
+import app.morphe.patches.youtube.shared.LayoutConstructorFingerprint
+import app.morphe.patches.youtube.video.information.playerStatusMethodRef
+import app.morphe.patches.youtube.video.information.videoInformationPatch
+import app.morphe.util.indexOfFirstInstructionOrThrow
+import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 
 private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/youtube/patches/AddToQueuePatch;"
+private const val QUEUE_PLAYBACK_CLASS =
+    "Lapp/morphe/extension/youtube/patches/QueuePlaybackPatch;"
 
 @Suppress("unused")
 val addToQueuePatch = bytecodePatch(
     name = "Add to queue",
-    description = "Overrides the feed flyout 'Play next in queue' with the Morphe video queue."
+    description = "Overrides the feed flyout queue actions with the Morphe video queue. " +
+            "Optionally enables one-tap Play next / Play last and advancing from Next or end of video."
 ) {
     dependsOn(
         flyoutPatch,
         settingsPatch,
         sharedExtensionPatch,
         elementProtoParserHookPatch,
-        authHookPatch
+        authHookPatch,
+        videoInformationPatch,
     )
 
     compatibleWith(COMPATIBILITY_YOUTUBE)
@@ -46,7 +57,8 @@ val addToQueuePatch = bytecodePatch(
         PreferenceScreen.FEED.addPreferences(
             noTitleUnsortedPreferenceCategory(
                 SwitchPreference("morphe_queue_override_flyout_menu", summary = true),
-                SwitchPreference("morphe_queue_add_flyout_menu", summary = true)
+                SwitchPreference("morphe_queue_add_flyout_menu", summary = true),
+                SwitchPreference("morphe_queue_advance_playback", summary = true),
             )
         )
 
@@ -113,6 +125,36 @@ val addToQueuePatch = bytecodePatch(
                     """ + getReplaceOnItemClickPatch("p2", "p2")
                 )
             }
+        }
+
+        LayoutConstructorFingerprint.clearMatch()
+        LayoutConstructorFingerprint.let {
+            val insertIndex = it.instructionMatches.last().index
+            val viewRegister = it.method.getInstruction<FiveRegisterInstruction>(insertIndex).registerC
+            it.method.addInstructions(
+                insertIndex,
+                """
+                    invoke-static { v$viewRegister }, $QUEUE_PLAYBACK_CLASS->hookPlayerControls(Landroid/view/View;)V
+                """
+            )
+        }
+
+        // Same pattern as loopVideoPatch: reuse the SGET_OBJECT register above native ENDED handling.
+        playerStatusMethodRef.get()!!.apply {
+            val insertIndex = indexOfFirstInstructionOrThrow(Opcode.SGET_OBJECT)
+            val freeRegister = getInstruction<OneRegisterInstruction>(insertIndex).registerA
+
+            addInstructionsWithLabels(
+                insertIndex,
+                """
+                    invoke-static/range { p1 .. p1 }, $QUEUE_PLAYBACK_CLASS->onPlayerStatus(Ljava/lang/Enum;)Z
+                    move-result v$freeRegister
+                    if-eqz v$freeRegister, :do_not_advance
+                    return-void
+                    :do_not_advance
+                    nop
+                """
+            )
         }
     }
 }

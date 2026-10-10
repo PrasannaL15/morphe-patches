@@ -26,8 +26,15 @@ import org.apache.commons.collections4.BidiMap;
 import org.apache.commons.collections4.bidimap.DualHashBidiMap;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 import app.morphe.extension.shared.Logger;
@@ -39,6 +46,7 @@ import app.morphe.extension.shared.theme.ThemeUtils;
 import app.morphe.extension.shared.ui.Dim;
 import app.morphe.extension.shared.ui.SheetBottomDialog;
 import app.morphe.extension.youtube.patches.LoadVideoPatch;
+import app.morphe.extension.youtube.patches.QueuePlaybackPatch;
 import app.morphe.extension.youtube.patches.VideoInformation;
 import app.morphe.extension.youtube.patches.utils.requests.CreatePlaylistRequest;
 import app.morphe.extension.youtube.patches.utils.requests.EditPlaylistRequest;
@@ -69,6 +77,8 @@ public class PlaylistPatch {
     private static final String fetchSucceededCreate = str("morphe_queue_manager_fetch_succeeded_create");
     private static final String fetchSucceededRemove = str("morphe_queue_manager_fetch_succeeded_remove");
     private static final String fetchSucceededSave = str("morphe_queue_manager_fetch_succeeded_save");
+    private static final String fetchSucceededPlayNext = str("morphe_queue_manager_fetch_succeeded_play_next");
+    private static final String fetchSucceededPlayLast = str("morphe_queue_manager_fetch_succeeded_play_last");
 
     private static volatile String playlistId = Settings.QUEUE_RESTORE.get()
             ? Settings.QUEUE_PLAYLIST_ID.get()
@@ -78,6 +88,18 @@ public class PlaylistPatch {
 
     @GuardedBy("itself")
     private static final BidiMap<String, String> lastVideoIds = new DualHashBidiMap<>();
+
+    @GuardedBy("lastVideoIds")
+    private static final List<String> orderedVideoIds = new ArrayList<>();
+
+    /** Locally removed ids awaiting confirmation from edit_playlist. */
+    private static final Set<String> pendingRemoteRemoveVideoIds = ConcurrentHashMap.newKeySet();
+
+    @GuardedBy("remoteRemoveLock")
+    private static final List<Pair<String, String>> remoteRemoveQueue = new ArrayList<>();
+    private static final Object remoteRemoveLock = new Object();
+    private static final AtomicBoolean remoteRemoveFlushScheduled = new AtomicBoolean(false);
+    private static final long REMOTE_REMOVE_COALESCE_MS = 150;
 
     /**
      * Invoked by extension.
@@ -126,14 +148,493 @@ public class PlaylistPatch {
             Map<String, String> items = GetPlaylistItemsRequest.fetch(playlistId, AuthUtils.getRequestHeader());
             if (items != null && !items.isEmpty()) {
                 synchronized (lastVideoIds) {
+                    final LinkedHashMap<String, String> merged = new LinkedHashMap<>();
                     for (Map.Entry<String, String> entry : items.entrySet()) {
-                        lastVideoIds.putIfAbsent(entry.getKey(), entry.getValue());
+                        if (!pendingRemoteRemoveVideoIds.contains(entry.getKey())) {
+                            merged.put(entry.getKey(), entry.getValue());
+                        }
+                    }
+                    for (String localId : orderedVideoIds) {
+                        if (pendingRemoteRemoveVideoIds.contains(localId)) {
+                            continue;
+                        }
+                        if (!merged.containsKey(localId) && lastVideoIds.containsKey(localId)) {
+                            merged.put(localId, lastVideoIds.get(localId));
+                        }
+                    }
+                    lastVideoIds.clear();
+                    orderedVideoIds.clear();
+                    for (Map.Entry<String, String> entry : merged.entrySet()) {
+                        lastVideoIds.put(entry.getKey(), entry.getValue());
+                        orderedVideoIds.add(entry.getKey());
                     }
                 }
-                Logger.printDebug(() -> "Synced " + items.size() + " items from queue playlist");
+                Logger.printDebug(() -> "Synced queue playlist items");
             }
             return null;
         });
+    }
+
+    private static void rememberOrdered(String videoIdToRemember, String setVideoId, @Nullable String afterVideoId) {
+        lastVideoIds.putIfAbsent(videoIdToRemember, setVideoId);
+        orderedVideoIds.remove(videoIdToRemember);
+        if (afterVideoId != null && !afterVideoId.isEmpty()) {
+            int anchor = orderedVideoIds.indexOf(afterVideoId);
+            if (anchor >= 0) {
+                orderedVideoIds.add(anchor + 1, videoIdToRemember);
+                return;
+            }
+        }
+        orderedVideoIds.add(videoIdToRemember);
+    }
+
+    private static volatile String lastQueuePlaybackVideoId = "";
+
+    public static boolean canPlayNextInQueue() {
+        return canPlayRelativeInQueue(+1);
+    }
+
+    public static boolean canPlayPreviousInQueue() {
+        return canPlayRelativeInQueue(-1);
+    }
+
+    /**
+     * @return true if the player response playlist id is the Morphe queue playlist.
+     */
+    public static boolean isPlayerInMorpheQueue() {
+        String ours = playlistId;
+        return !ours.isEmpty() && ours.equals(VideoInformation.getPlaylistId());
+    }
+
+    /**
+     * Updates the queue cursor for {@code newlyLoadedVideoId}. When moving forward,
+     * removes earlier items (played / skipped). Going backward (Previous) keeps the queue.
+     */
+    public static void syncQueuePlaybackPosition(String newlyLoadedVideoId) {
+        String id = sanitizeVideoId(newlyLoadedVideoId);
+        if (id.isEmpty()) {
+            return;
+        }
+        final List<String> playedBefore = new ArrayList<>();
+        synchronized (lastVideoIds) {
+            int index = orderedVideoIds.indexOf(id);
+            if (index < 0) {
+                return;
+            }
+            int previousIndex = lastQueuePlaybackVideoId.isEmpty()
+                    ? -1
+                    : orderedVideoIds.indexOf(lastQueuePlaybackVideoId);
+            // Previous / same item: never trim. Only remove items when index moves forward.
+            if (previousIndex >= 0 && index <= previousIndex) {
+                lastQueuePlaybackVideoId = id;
+                QueuePlaybackPatch.refreshQueueNavButtons();
+                return;
+            }
+            if (index > 0) {
+                playedBefore.addAll(orderedVideoIds.subList(0, index));
+            }
+            lastQueuePlaybackVideoId = id;
+        }
+        if (!playedBefore.isEmpty()) {
+            removeVideosFromQueueLocalAndRemote(playedBefore);
+        }
+        QueuePlaybackPatch.refreshQueueNavButtons();
+    }
+
+    private static void removeVideosFromQueueLocalAndRemote(List<String> videoIds) {
+        if (videoIds == null || videoIds.isEmpty()) {
+            return;
+        }
+        final List<Pair<String, String>> removals = new ArrayList<>();
+        synchronized (lastVideoIds) {
+            for (String videoIdToRemove : videoIds) {
+                String setId = lastVideoIds.get(videoIdToRemove);
+                if (setId != null) {
+                    removals.add(new Pair<>(videoIdToRemove, setId));
+                }
+                lastVideoIds.remove(videoIdToRemove);
+                orderedVideoIds.remove(videoIdToRemove);
+                pendingRemoteRemoveVideoIds.add(videoIdToRemove);
+            }
+        }
+        if (removals.isEmpty()) {
+            return;
+        }
+        if (playlistId.isEmpty()) {
+            pendingRemoteRemoveVideoIds.removeAll(videoIds);
+            return;
+        }
+        enqueueRemoteRemoves(removals);
+    }
+
+    private static void enqueueRemoteRemoves(List<Pair<String, String>> removals) {
+        synchronized (remoteRemoveLock) {
+            remoteRemoveQueue.addAll(removals);
+        }
+        if (!remoteRemoveFlushScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        Utils.runOnBackgroundThread(() -> {
+            try {
+                do {
+                    try {
+                        Thread.sleep(REMOTE_REMOVE_COALESCE_MS);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    flushRemoteRemovesOnce();
+                } while (hasPendingRemoteRemoves());
+            } finally {
+                remoteRemoveFlushScheduled.set(false);
+                if (hasPendingRemoteRemoves()) {
+                    enqueueRemoteRemoves(Collections.emptyList());
+                }
+            }
+        });
+    }
+
+    private static boolean hasPendingRemoteRemoves() {
+        synchronized (remoteRemoveLock) {
+            return !remoteRemoveQueue.isEmpty();
+        }
+    }
+
+    private static void flushRemoteRemovesOnce() {
+        final String currentPlaylistId = playlistId;
+        final List<Pair<String, String>> batch;
+        synchronized (remoteRemoveLock) {
+            if (remoteRemoveQueue.isEmpty()) {
+                return;
+            }
+            if (currentPlaylistId.isEmpty()) {
+                remoteRemoveQueue.clear();
+                return;
+            }
+            final LinkedHashMap<String, String> deduped = new LinkedHashMap<>();
+            for (Pair<String, String> removal : remoteRemoveQueue) {
+                deduped.put(removal.getFirst(), removal.getSecond());
+            }
+            remoteRemoveQueue.clear();
+            batch = new ArrayList<>(deduped.size());
+            for (Map.Entry<String, String> entry : deduped.entrySet()) {
+                batch.add(new Pair<>(entry.getKey(), entry.getValue()));
+            }
+        }
+
+        final Set<String> setVideoIds = new LinkedHashSet<>();
+        for (Pair<String, String> removal : batch) {
+            setVideoIds.add(removal.getSecond());
+        }
+        boolean ok = EditPlaylistRequest.removeVideosSync(
+                currentPlaylistId, setVideoIds, AuthUtils.getRequestHeader());
+        for (Pair<String, String> removal : batch) {
+            EditPlaylistRequest.clearVideoId(removal.getFirst());
+            if (ok) {
+                pendingRemoteRemoveVideoIds.remove(removal.getFirst());
+            }
+        }
+        Logger.printDebug(() -> "Batch removed " + batch.size() + " queue playlist items, ok=" + ok);
+    }
+
+    private static boolean canPlayRelativeInQueue(int delta) {
+        if (!Settings.QUEUE_ADVANCE_PLAYBACK.get() || playlistId.isEmpty()) {
+            return false;
+        }
+        if (PlayerType.getCurrent().isNoneOrHidden()) {
+            return false;
+        }
+        synchronized (lastVideoIds) {
+            return resolveNextVideoIdLocked(delta) != null;
+        }
+    }
+
+    public static boolean playNextInQueue() {
+        return playRelativeInQueue(+1);
+    }
+
+    public static boolean playPreviousInQueue() {
+        return playRelativeInQueue(-1);
+    }
+
+    private static String sanitizeVideoId(String videoId) {
+        if (videoId == null || videoId.isEmpty()) {
+            return "";
+        }
+        final int amp = videoId.indexOf('&');
+        return amp > 0 ? videoId.substring(0, amp) : videoId;
+    }
+
+    @Nullable
+    private static String resolveNextVideoIdLocked(int delta) {
+        if (orderedVideoIds.isEmpty()) {
+            return null;
+        }
+
+        String currentVideoId = sanitizeVideoId(VideoInformation.getVideoId());
+        String responseVideoId = sanitizeVideoId(VideoInformation.getPlayerResponseVideoId());
+        if (currentVideoId.isEmpty()) {
+            currentVideoId = responseVideoId;
+        }
+
+        int index = orderedVideoIds.indexOf(currentVideoId);
+        if (index < 0 && !responseVideoId.isEmpty()) {
+            index = orderedVideoIds.indexOf(responseVideoId);
+        }
+        if (index < 0 && !lastQueuePlaybackVideoId.isEmpty()) {
+            index = orderedVideoIds.indexOf(lastQueuePlaybackVideoId);
+        }
+        if (index < 0) {
+            return null;
+        }
+
+        lastQueuePlaybackVideoId = orderedVideoIds.get(index);
+        int targetIndex = index + delta;
+        if (targetIndex < 0 || targetIndex >= orderedVideoIds.size()) {
+            return null;
+        }
+        return orderedVideoIds.get(targetIndex);
+    }
+
+    private static boolean playRelativeInQueue(int delta) {
+        try {
+            if (!Settings.QUEUE_ADVANCE_PLAYBACK.get() || playlistId.isEmpty()) {
+                return false;
+            }
+            if (PlayerType.getCurrent().isNoneOrHidden()) {
+                return false;
+            }
+
+            final String currentPlaylistId = playlistId;
+            String targetVideoId;
+            synchronized (lastVideoIds) {
+                targetVideoId = resolveNextVideoIdLocked(delta);
+                if (targetVideoId == null) {
+                    return false;
+                }
+                // Leave lastQueuePlaybackVideoId on the current item until the new video
+                // loads — syncQueuePlaybackPosition needs it to detect forward vs previous.
+            }
+
+            // Use watch URL with list= so native Next stays in the Morphe playlist.
+            // Do not pass list= through openVideoIntentWithInternalContext (treated as video id).
+            final String url = "https://www.youtube.com/watch?v=" + targetVideoId
+                    + "&list=" + currentPlaylistId;
+            Logger.printDebug(() -> "Queue advance delta=" + delta + " videoId=" + targetVideoId);
+            LoadVideoPatch.openVideoIntent(url, false);
+            return true;
+        } catch (Exception ex) {
+            Logger.printException(() -> "playRelativeInQueue failure", ex);
+            return false;
+        }
+    }
+
+    /**
+     * Inserts {@code targetVideoId} immediately after the currently playing video.
+     */
+    public static void queuePlayNextOneTap(Context context, String targetVideoId) {
+        if (AuthUtils.isNotLoggedIn()) {
+            handleCheckError(checkFailedAuth);
+            return;
+        }
+        if (targetVideoId == null || targetVideoId.isEmpty()) {
+            handleCheckError(checkFailedVideoId);
+            return;
+        }
+        Utils.runOnBackgroundThread(() -> {
+            boolean ok = ensureQueueAndInsertAfterCurrent(targetVideoId);
+            if (ok) {
+                String playingId = sanitizeVideoId(VideoInformation.getVideoId());
+                if (playingId.isEmpty()) {
+                    playingId = sanitizeVideoId(VideoInformation.getPlayerResponseVideoId());
+                }
+                if (!playingId.isEmpty()) {
+                    lastQueuePlaybackVideoId = playingId;
+                }
+                showToast(fetchSucceededPlayNext);
+                QueuePlaybackPatch.refreshQueueNavButtons();
+            } else {
+                showToast(fetchFailedAdd);
+            }
+        });
+    }
+
+    /**
+     * Appends {@code targetVideoId} to the end of the Morphe queue.
+     */
+    public static void queuePlayLastOneTap(Context context, String targetVideoId) {
+        if (AuthUtils.isNotLoggedIn()) {
+            handleCheckError(checkFailedAuth);
+            return;
+        }
+        if (targetVideoId == null || targetVideoId.isEmpty()) {
+            handleCheckError(checkFailedVideoId);
+            return;
+        }
+        videoId = targetVideoId;
+        Utils.runOnBackgroundThread(() -> {
+            boolean ok = appendVideo(targetVideoId, AuthUtils.getRequestHeader());
+            if (ok) {
+                String playingId = sanitizeVideoId(VideoInformation.getVideoId());
+                if (playingId.isEmpty()) {
+                    playingId = sanitizeVideoId(VideoInformation.getPlayerResponseVideoId());
+                }
+                if (!playingId.isEmpty()) {
+                    lastQueuePlaybackVideoId = playingId;
+                }
+                showToast(fetchSucceededPlayLast);
+                QueuePlaybackPatch.refreshQueueNavButtons();
+            } else {
+                fetchQueue(context, false, false, false, false, true, fetchSucceededPlayLast);
+            }
+        });
+    }
+
+    /**
+     * Ensures the currently playing video is in the queue, then inserts {@code targetVideoId}
+     * immediately after it.
+     */
+    private static boolean ensureQueueAndInsertAfterCurrent(String targetVideoId) {
+        Utils.verifyOffMainThread();
+        Map<String, String> headers = AuthUtils.getRequestHeader();
+        String playingCandidate = VideoInformation.getVideoId();
+        if (playingCandidate.isEmpty()) {
+            playingCandidate = VideoInformation.getPlayerResponseVideoId();
+        }
+        final String playingId = playingCandidate;
+
+        // Nothing playing: fall back to append.
+        if (playingId.isEmpty()) {
+            return appendVideo(targetVideoId, headers);
+        }
+
+        // Same video as currently playing: ensure it exists in the queue.
+        if (playingId.equals(targetVideoId)) {
+            synchronized (lastVideoIds) {
+                if (lastVideoIds.containsKey(targetVideoId)) {
+                    return true;
+                }
+            }
+            return appendVideo(targetVideoId, headers);
+        }
+
+        String localPlaylistId;
+        String anchorSetVideoId;
+        String existingSetId;
+        synchronized (lastVideoIds) {
+            localPlaylistId = playlistId;
+            anchorSetVideoId = lastVideoIds.get(playingId);
+            existingSetId = lastVideoIds.get(targetVideoId);
+        }
+
+        if (localPlaylistId.isEmpty()) {
+            if (!createQueueWithVideo(playingId, headers)) {
+                return false;
+            }
+            synchronized (lastVideoIds) {
+                localPlaylistId = playlistId;
+                anchorSetVideoId = lastVideoIds.get(playingId);
+            }
+        } else if (anchorSetVideoId == null) {
+            String seeded = EditPlaylistRequest.addVideoSync(playingId, localPlaylistId, headers);
+            if (seeded == null || seeded.isEmpty()) {
+                playlistId = Settings.QUEUE_PLAYLIST_ID.resetToDefault();
+                if (!createQueueWithVideo(playingId, headers)) {
+                    return false;
+                }
+                synchronized (lastVideoIds) {
+                    localPlaylistId = playlistId;
+                    anchorSetVideoId = lastVideoIds.get(playingId);
+                }
+            } else {
+                synchronized (lastVideoIds) {
+                    rememberOrdered(playingId, seeded, null);
+                    anchorSetVideoId = seeded;
+                }
+            }
+        }
+
+        if (localPlaylistId.isEmpty() || anchorSetVideoId == null || anchorSetVideoId.isEmpty()) {
+            return false;
+        }
+
+        if (existingSetId != null) {
+            boolean moved = EditPlaylistRequest.moveVideoAfterSync(
+                    localPlaylistId, existingSetId, anchorSetVideoId, headers);
+            if (moved) {
+                synchronized (lastVideoIds) {
+                    orderedVideoIds.remove(targetVideoId);
+                    int anchor = orderedVideoIds.indexOf(playingId);
+                    if (anchor >= 0) {
+                        orderedVideoIds.add(anchor + 1, targetVideoId);
+                    } else {
+                        orderedVideoIds.add(targetVideoId);
+                    }
+                }
+            }
+            return moved;
+        }
+
+        String addedSetId = EditPlaylistRequest.addVideoSync(targetVideoId, localPlaylistId, headers);
+        if (addedSetId == null || addedSetId.isEmpty()) {
+            return false;
+        }
+        boolean moved = EditPlaylistRequest.moveVideoAfterSync(
+                localPlaylistId, addedSetId, anchorSetVideoId, headers);
+        synchronized (lastVideoIds) {
+            rememberOrdered(targetVideoId, addedSetId, moved ? playingId : null);
+        }
+        Logger.printDebug(() -> "Inserted " + targetVideoId + " after " + playingId + ", moved=" + moved);
+        return true;
+    }
+
+    private static boolean createQueueWithVideo(String seedVideoId, Map<String, String> headers) {
+        CreatePlaylistRequest.fetchRequestIfNeeded(seedVideoId, headers);
+        CreatePlaylistRequest request = CreatePlaylistRequest.getRequestForVideoId(seedVideoId);
+        if (request == null) {
+            return false;
+        }
+        Pair<String, String> playlistIds = request.getPlaylistId();
+        if (playlistIds == null) {
+            return false;
+        }
+        String createdPlaylistId = playlistIds.getFirst();
+        String setVideoId = playlistIds.getSecond();
+        if (createdPlaylistId == null || setVideoId == null) {
+            return false;
+        }
+        synchronized (lastVideoIds) {
+            playlistId = createdPlaylistId;
+            if (Settings.QUEUE_RESTORE.get()) {
+                Settings.QUEUE_PLAYLIST_ID.save(createdPlaylistId);
+            }
+            lastVideoIds.clear();
+            orderedVideoIds.clear();
+            rememberOrdered(seedVideoId, setVideoId, null);
+        }
+        Logger.printDebug(() -> "Queue created for play-next, playlistId: " + createdPlaylistId);
+        return true;
+    }
+
+    private static boolean appendVideo(String targetVideoId, Map<String, String> headers) {
+        String localPlaylistId;
+        synchronized (lastVideoIds) {
+            localPlaylistId = playlistId;
+            if (!localPlaylistId.isEmpty() && lastVideoIds.containsKey(targetVideoId)) {
+                return true;
+            }
+        }
+        if (localPlaylistId.isEmpty()) {
+            return createQueueWithVideo(targetVideoId, headers);
+        }
+        String addedSetId = EditPlaylistRequest.addVideoSync(targetVideoId, localPlaylistId, headers);
+        if (addedSetId == null || addedSetId.isEmpty()) {
+            return false;
+        }
+        synchronized (lastVideoIds) {
+            rememberOrdered(targetVideoId, addedSetId, null);
+        }
+        return true;
     }
 
     private static void buildBottomSheetDialog(Context context, QueueManager[] queueManagerEntries) {
@@ -198,6 +699,12 @@ public class PlaylistPatch {
 
     private static void fetchQueue(Context context, boolean remove, boolean openPlaylist,
                                    boolean openVideo, boolean reload, boolean retry) {
+        fetchQueue(context, remove, openPlaylist, openVideo, reload, retry, null);
+    }
+
+    private static void fetchQueue(Context context, boolean remove, boolean openPlaylist,
+                                   boolean openVideo, boolean reload, boolean retry,
+                                   @Nullable String successToastOverride) {
         String currentPlaylistId = playlistId;
         String currentVideoId = videoId;
         Utils.runOnBackgroundThread(() -> {
@@ -215,8 +722,10 @@ public class PlaylistPatch {
                                 if (Settings.QUEUE_RESTORE.get()) {
                                     Settings.QUEUE_PLAYLIST_ID.save(createdPlaylistId);
                                 }
-                                lastVideoIds.putIfAbsent(currentVideoId, setVideoId);
-                                showToast(fetchSucceededCreate);
+                                rememberOrdered(currentVideoId, setVideoId, null);
+                                showToast(successToastOverride != null
+                                        ? successToastOverride
+                                        : fetchSucceededCreate);
                                 Logger.printDebug(() -> "Queue created, playlistId: "
                                         + createdPlaylistId + ", setVideoId: " + setVideoId);
                                 if (openPlaylist) {
@@ -237,7 +746,8 @@ public class PlaylistPatch {
                         Logger.printDebug(() -> "fetchedSetVideoId: " + fetchedSetVideoId);
                         if (remove) {
                             if ("".equals(fetchedSetVideoId)) {
-                                lastVideoIds.remove(currentVideoId, setVideoId);
+                                lastVideoIds.remove(currentVideoId);
+                                orderedVideoIds.remove(currentVideoId);
                                 EditPlaylistRequest.clearVideoId(currentVideoId);
                                 showToast(fetchSucceededRemove);
                                 if (openPlaylist) {
@@ -257,14 +767,17 @@ public class PlaylistPatch {
                                 }
                                 // Clear saved playlist and try again.
                                 playlistId = Settings.QUEUE_PLAYLIST_ID.resetToDefault();
-                                fetchQueue(context, false, openPlaylist, openVideo, reload, false);
+                                fetchQueue(context, false, openPlaylist, openVideo, reload, false,
+                                        successToastOverride);
                                 return;
                             }
 
-                            lastVideoIds.putIfAbsent(currentVideoId, fetchedSetVideoId);
+                            rememberOrdered(currentVideoId, fetchedSetVideoId, null);
                             EditPlaylistRequest.clearVideoId(currentVideoId);
                             Logger.printDebug(() -> "Video added, setVideoId: " + fetchedSetVideoId);
-                            showToast(fetchSucceededAdd);
+                            showToast(successToastOverride != null
+                                    ? successToastOverride
+                                    : fetchSucceededAdd);
                             if (openPlaylist) {
                                 openQueue(context, currentVideoId, openVideo, reload);
                             }

@@ -55,10 +55,7 @@ public final class AddToQueuePatch {
                             flyoutPanel,
                             queueButtonDrawable,
                             queueButtonName,
-                            v -> flyoutButtonClickLogic(
-                                    queueButtonOriginalNames.get(0),
-                                    videoId
-                            ),
+                            v -> openQueueSheet(videoId),
                             index
                     );
                 }
@@ -172,23 +169,53 @@ public final class AddToQueuePatch {
 
     public static boolean flyoutButtonClickLogic(String buttonName, String videoId) {
         try {
-            if (queueButtonOriginalNames.contains(buttonName)) {
-                Logger.printDebug(() -> "Opening custom queue flyout with videoId: " + videoId);
-
-                Activity activity = Utils.getActivity();
-                if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
-                    PlaylistPatch.prepareDialogBuilder(activity, videoId);
-                } else {
-                    Logger.printException(() -> "Could not open queue flyout, activity is not available");
-                }
-
-                FlyoutUtils.dismissFlyout(); // Must dismiss after showing dialog.
-                return true;
+            if (!queueButtonOriginalNames.contains(buttonName)) {
+                return false;
             }
+
+            Activity activity = Utils.getActivity();
+            if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+                Logger.printException(() -> "Could not handle queue flyout, activity is not available");
+                return false;
+            }
+
+            // One-tap Play next / Play last is opt-in via QUEUE_ADVANCE_PLAYBACK.
+            if (Settings.QUEUE_ADVANCE_PLAYBACK.get()) {
+                if ("QUEUE_PLAY_NEXT".equals(buttonName)) {
+                    PlaylistPatch.queuePlayNextOneTap(activity, videoId);
+                    FlyoutUtils.dismissFlyout();
+                    return true;
+                }
+                if ("QUEUE_PLAY_LAST".equals(buttonName)) {
+                    PlaylistPatch.queuePlayLastOneTap(activity, videoId);
+                    FlyoutUtils.dismissFlyout();
+                    return true;
+                }
+            }
+
+            return openQueueSheet(videoId);
         } catch (Exception ex) {
             Logger.printException(() -> "flyoutButtonClickLogic failure: " + buttonName, ex);
         }
 
         return false;
+    }
+
+    private static boolean openQueueSheet(String videoId) {
+        try {
+            Logger.printDebug(() -> "Opening custom queue flyout with videoId: " + videoId);
+            Activity activity = Utils.getActivity();
+            if (activity != null && !activity.isFinishing() && !activity.isDestroyed()) {
+                PlaylistPatch.prepareDialogBuilder(activity, videoId);
+            } else {
+                Logger.printException(() -> "Could not open queue flyout, activity is not available");
+                return false;
+            }
+            FlyoutUtils.dismissFlyout();
+            return true;
+        } catch (Exception ex) {
+            Logger.printException(() -> "openQueueSheet failure", ex);
+            return false;
+        }
     }
 }

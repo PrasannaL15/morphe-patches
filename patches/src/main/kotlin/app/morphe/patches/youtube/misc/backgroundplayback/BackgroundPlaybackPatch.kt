@@ -26,6 +26,7 @@ import app.morphe.patches.youtube.misc.playservice.is_20_29_or_greater
 import app.morphe.patches.youtube.misc.playservice.is_20_49_or_greater
 import app.morphe.patches.youtube.misc.playservice.is_21_15_or_greater
 import app.morphe.patches.youtube.misc.playservice.is_21_21_or_greater
+import app.morphe.patches.youtube.misc.playservice.is_21_23_or_greater
 import app.morphe.patches.youtube.misc.playservice.is_21_36_or_greater
 import app.morphe.patches.youtube.misc.playservice.versionCheckPatch
 import app.morphe.patches.youtube.misc.settings.PreferenceScreen
@@ -126,13 +127,19 @@ val backgroundPlaybackPatch = bytecodePatch(
         }
 
         // Enable background playback option in YouTube settings
-        BackgroundPlaybackSettingsFingerprint.originalMethod.apply {
-            val booleanCalls = instructions.filter {
-                it.getReference<MethodReference>()?.returnType == "Z"
-            }
-
-            booleanCalls[1].getReference<MethodReference>()!!
+        if (is_21_23_or_greater) {
+            BackgroundPlaybackSettingsFingerprint.instructionMatches.first()
+                .instruction.getReference<MethodReference>()!!
                 .getMutableMethod().addBackgroundPlaybackIsPatchEnabledHook()
+        } else {
+            BackgroundPlaybackSettingsLegacyFingerprint.originalMethod.apply {
+                val booleanCalls = instructions.filter {
+                    it.getReference<MethodReference>()?.returnType == "Z"
+                }
+
+                booleanCalls[1].getReference<MethodReference>()!!
+                    .getMutableMethod().addBackgroundPlaybackIsPatchEnabledHook()
+            }
         }
 
         // Prevents playback from resuming if it was interrupted from the notification
